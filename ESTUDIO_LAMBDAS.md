@@ -1,10 +1,11 @@
-# Estudio: Lambda `guardar-log-dynamodb` + DynamoDB + GitHub Actions
+# Estudio completo: Consumers de Kafka + Lambda + DynamoDB + GitHub Actions
 
-Este documento explica, de la forma más simple posible, todo lo necesario para entender y desplegar este repositorio:
+Este documento explica, de la forma más simple posible, todo lo necesario para entender y desplegar este repositorio. Está dividido en dos partes:
 
-1. Qué hace la función Lambda.
-2. Cómo funciona el workflow de GitHub Actions.
-3. Qué pasos hay que hacer en la consola web de AWS antes del primer `git push`.
+- **Parte I (secciones 1 a 12):** la función Lambda `guardar-log-dynamodb`, su tabla en DynamoDB y su workflow de despliegue.
+- **Parte II (secciones 13 a 19):** los 3 consumers de Kafka del topic `compras-topic`, su despliegue en una EC2 con PM2 y el diagrama C3.
+
+Todo el proyecto usa JavaScript puro y CommonJS, sin frameworks.
 
 ---
 
@@ -13,20 +14,28 @@ Este documento explica, de la forma más simple posible, todo lo necesario para 
 La idea es esta:
 
 ```text
-Consumer de Kafka  --->  Lambda guardar-log-dynamodb  --->  Tabla LogsCompras (DynamoDB)
+                         +--> grupo-logs-dynamo ------> Lambda guardar-log-dynamodb --> DynamoDB
+Topic compras-topic -----+--> grupo-pago-validacion --> valida monto > 0
+                         +--> grupo-pago-comprobante --> genera código de boleta
 ```
 
-- Un **Consumer de Kafka** envía un evento (un JSON) a la Lambda.
-- La **Lambda** toma ese JSON, le agrega un `id` y una `fecha`, y lo guarda en **DynamoDB**.
-- Cada vez que hacemos `git push` a la rama `main`, **GitHub Actions** empaqueta la Lambda y actualiza el código en AWS automáticamente.
+- Un **producer** escribe mensajes JSON en el topic `compras-topic`.
+- Los **3 consumers** leen el mismo topic, pero cada uno con un `groupId` distinto. Kafka entrega una copia de cada mensaje a cada grupo.
+- El consumer de logs invoca la **Lambda**, y la Lambda guarda el evento en **DynamoDB**.
+- Los otros dos consumers hacen la validación del pago y la generación de la boleta.
+- Hay **dos workflows** de GitHub Actions:
+  - `deploy-lambda.yml`: se ejecuta en cada push a `main` y actualiza la Lambda. Así se definió en la Parte I y no se modificó.
+  - `deploy-consumers.yml`: se ejecuta solo cuando cambia `consumers/**` y despliega los consumers por SSH en la EC2.
 
-Flujo de despliegue:
+> El workflow de la Lambda no tiene filtro de rutas, así que también se ejecutará cuando hagas un push que solo cambie `consumers/**`. Es el comportamiento actual del CI/CD existente; si se quisiera separar, habría que agregarle un `paths` a `deploy-lambda.yml`.
+
+Flujo de despliegue de la Lambda:
 
 ```text
 git push origin main
         |
         v
-GitHub Actions
+GitHub Actions (deploy-lambda.yml)
   1. descarga el repositorio
   2. configura las credenciales de AWS
   3. crea function.zip con el contenido de /guardar-log-dynamodb
@@ -34,6 +43,21 @@ GitHub Actions
         |
         v
 Lambda actualizada en AWS (versión $LATEST)
+```
+
+Flujo de despliegue de los consumers:
+
+```text
+git push origin main (con cambios en consumers/**)
+        |
+        v
+GitHub Actions (deploy-consumers.yml)
+  1. se conecta por SSH a la EC2
+  2. entra a /home/ec2-user/kafka-consumers-node/consumers
+  3. ejecuta git pull, npm install y pm2 restart (o pm2 start)
+        |
+        v
+Consumers actualizados en la EC2
 ```
 
 ---
@@ -44,14 +68,21 @@ Lambda actualizada en AWS (versión $LATEST)
 kafka-consumers-node/
 ├── .github/
 │   └── workflows/
-│       └── deploy-lambda.yml        <-- CI/CD con GitHub Actions
+│       ├── deploy-lambda.yml        <-- CI/CD de la Lambda
+│       └── deploy-consumers.yml     <-- CI/CD de los consumers
 ├── guardar-log-dynamodb/
 │   └── index.js                     <-- código de la Lambda
+├── consumers/
+│   ├── package.json                 <-- dependencias de los consumers
+│   ├── .env.example                 <-- variables de entorno de ejemplo
+│   └── index.js                     <-- los 3 consumers de Kafka
 ├── .gitignore
 └── ESTUDIO_LAMBDAS.md               <-- este documento (único .md)
 ```
 
-No hay `package.json` ni `node_modules` porque el runtime **Node.js 20.x** de AWS Lambda ya trae incluido el AWS SDK v3 (`@aws-sdk/client-dynamodb` y `@aws-sdk/lib-dynamodb`). Por eso el ZIP solo necesita el archivo `index.js`.
+La carpeta `guardar-log-dynamodb` no tiene `package.json` ni `node_modules` porque el runtime **Node.js 20.x** de AWS Lambda ya trae incluido el AWS SDK v3 (`@aws-sdk/client-dynamodb` y `@aws-sdk/lib-dynamodb`). Por eso el ZIP solo necesita el archivo `index.js`.
+
+La carpeta `consumers` sí tiene su propio `package.json`, porque se ejecuta en una EC2 con Node.js y necesita instalar `kafkajs`, `@aws-sdk/client-lambda` y `dotenv`.
 
 ---
 
@@ -230,7 +261,7 @@ El archivo real está en `guardar-log-dynamodb/index.js`.
 
 ---
 
-## 5. Cómo funciona el workflow de GitHub Actions
+## 5. Cómo funciona el workflow de la Lambda (`deploy-lambda.yml`)
 
 Archivo: `.github/workflows/deploy-lambda.yml`
 
@@ -456,7 +487,7 @@ Si el repositorio ya está clonado y tiene el remoto configurado:
 ```bash
 cd kafka-consumers-node
 git add .
-git commit -m "Agrega Lambda guardar-log-dynamodb y CI/CD"
+git commit -m "Agrega Lambda, consumers de Kafka y CI/CD"
 git push origin main
 ```
 
@@ -467,26 +498,31 @@ git init
 git branch -M main
 git remote add origin https://github.com/TU_USUARIO/TU_REPOSITORIO.git
 git add .
-git commit -m "Agrega Lambda guardar-log-dynamodb y CI/CD"
+git commit -m "Agrega Lambda, consumers de Kafka y CI/CD"
 git push -u origin main
 ```
 
+> Antes de este push, si ya agregaste la carpeta `consumers`, prepara la EC2 y los secrets `EC2_HOST`, `EC2_USER` y `EC2_SSH_KEY` (sección 13.9). Si no están configurados, el workflow `deploy-consumers` fallará.
+
 Al hacer push:
 
-1. GitHub detecta el archivo `.github/workflows/deploy-lambda.yml`.
-2. Se abre la pestaña **Actions** y comienza el workflow **Deploy Lambda guardar-log-dynamodb**.
-3. Si todo está bien, aparece un check verde.
-4. Si algo falla, haz clic en el workflow y luego en el paso rojo para leer el error.
+1. GitHub detecta los dos workflows: `deploy-lambda.yml` y `deploy-consumers.yml`.
+2. Se abre la pestaña **Actions**. El workflow **Deploy Lambda guardar-log-dynamodb** corre en cada push a `main`.
+3. El workflow **Deploy consumers Kafka** solo corre si el push incluye cambios en `consumers/**`.
+4. Si todo está bien, aparecen los checks verdes.
+5. Si algo falla, haz clic en el workflow y luego en el paso rojo para leer el error.
 
 ---
 
-## 9. Verificar que el despliegue funcionó
+## 9. Verificar que el despliegue de la Lambda funcionó
 
 1. Ve a **GitHub** → pestaña **Actions**.
 2. Abre el workflow y confirma que los 4 pasos terminaron en verde.
 3. Ve a la consola de **AWS Lambda** → `guardar-log-dynamodb`.
 4. En **Code**, deberías ver el `index.js` desplegado (puedes refrescar la página).
 5. Revisa **Last modified** para confirmar la fecha de actualización.
+
+> La verificación del despliegue de los consumers está en la sección 13.10.
 
 ---
 
@@ -577,3 +613,720 @@ Estas son las ideas que conviene poder explicar:
 8. **No se sube `node_modules`** porque el runtime Node.js 20 ya incluye el SDK de AWS; el ZIP solo contiene `index.js`.
 9. **El workflow actualiza `$LATEST`**. No crea versiones ni aliases; eso sería un siguiente paso si se quisiera un despliegue más controlado.
 10. **Mejora de seguridad para producción**: en lugar de claves de larga duración, usar OIDC entre GitHub Actions y AWS. En el laboratorio se usan claves porque AWS Academy no siempre permite OIDC.
+
+---
+
+# PARTE II: Consumers de Kafka
+
+## 13. Consumers de Kafka
+
+### 13.1. Qué hace cada consumer
+
+Los tres consumers leen el mismo topic, `compras-topic`, pero pertenecen a grupos distintos. Eso hace que Kafka le entregue **una copia del mismo mensaje a cada grupo**.
+
+| Consumer | `groupId` | Lógica | Salida esperada |
+|---|---|---|---|
+| 1. Logs | `grupo-logs-dynamo` | Invoca la Lambda `guardar-log-dynamodb` con el JSON del mensaje | `[LOGS DYNAMO] Lambda invocada...` |
+| 2. Validación | `grupo-pago-validacion` | Convierte `monto` a número y verifica que sea mayor que 0 | `[VALIDACION PAGO] Pago aprobado` |
+| 3. Comprobante | `grupo-pago-comprobante` | Genera un código aleatorio de boleta | `[COMPROBANTE PAGO] Boleta generada` |
+
+Los tres se levantan desde un solo archivo `consumers/index.js` y un solo proceso de Node.js. PM2 se encarga de mantener ese proceso vivo en la EC2 con el nombre `consumers`.
+
+### 13.2. Por qué los `groupId` deben ser distintos
+
+Esta es la parte más importante de Kafka para la defensa oral:
+
+```text
+Mismo groupId:
+  mensaje 1 --> consumer A
+  mensaje 2 --> consumer B
+  (Kafka reparte los mensajes entre los consumers del grupo)
+
+Distinto groupId:
+  mensaje 1 --> grupo 1 (recibe una copia)
+  mensaje 1 --> grupo 2 (recibe otra copia)
+  mensaje 1 --> grupo 3 (recibe otra copia)
+  (cada grupo recibe todos los mensajes)
+```
+
+Por eso:
+
+- Si los tres consumers usaran `groupId: "mi-grupo"`, Kafka repartiría los mensajes entre ellos y **no todos** ejecutarían la misma lógica.
+- Al usar `grupo-logs-dynamo`, `grupo-pago-validacion` y `grupo-pago-comprobante`, cada grupo recibe el 100% de los mensajes y puede hacer su propia tarea.
+
+En el código se usa `fromBeginning: true`. Eso significa que, la primera vez que un grupo se conecta, lee los mensajes que ya estaban en el topic. Después Kafka guarda el offset del grupo y continúa desde donde quedó. En producción normalmente se usa `fromBeginning: false` para no reprocesar mensajes antiguos.
+
+### 13.3. Estructura y variables de entorno
+
+```text
+consumers/
+├── package.json      <-- dependencias y script npm start
+├── .env.example      <-- ejemplo de variables (sí se sube al repo)
+├── .env              <-- variables reales (NO se sube, está en .gitignore)
+└── index.js          <-- los 3 consumers
+```
+
+Variables:
+
+| Variable | Para qué sirve | Ejemplo |
+|---|---|---|
+| `KAFKA_BROKERS` | Dirección(es) del broker. Si hay varias, van separadas por coma | `localhost:9092` |
+| `KAFKA_TOPIC` | Topic que se consume | `compras-topic` |
+| `LAMBDA_LOGS_NAME` | Nombre exacto de la Lambda | `guardar-log-dynamodb` |
+| `AWS_REGION` | Región de la Lambda | `us-east-1` |
+| `AWS_ACCESS_KEY_ID` | Credencial de AWS | `AKIA...` |
+| `AWS_SECRET_ACCESS_KEY` | Clave secreta de AWS | `...` |
+| `AWS_SESSION_TOKEN` | Token temporal de AWS Academy | `IQoJ...` |
+
+`dotenv` lee el archivo `.env` al iniciar el proceso. El archivo `.env.example` se sube al repositorio como documentación, pero el `.env` real está en `.gitignore` y **nunca** debe subirse.
+
+### 13.4. Diagrama C3 en Mermaid
+
+El modelo C4 tiene cuatro niveles: contexto (C1), contenedores (C2), componentes (C3) y código (C4). Este es el **diagrama C3**, es decir, el nivel de componentes: muestra los 3 consumers, sus grupos y las piezas con las que se comunican.
+
+```mermaid
+C4Component
+title Diagrama C3 - Componentes de los consumers de compras
+
+Container(kafka, "Apache Kafka", "Mensajería", "Topic compras-topic")
+Container_Boundary(ec2, "EC2 Amazon Linux") {
+  Component(cLogs, "Consumer 1 - Logs", "Node.js + KafkaJS", "groupId: grupo-logs-dynamo")
+  Component(cPago, "Consumer 2 - Validación", "Node.js + KafkaJS", "groupId: grupo-pago-validacion")
+  Component(cBoleta, "Consumer 3 - Comprobante", "Node.js + KafkaJS", "groupId: grupo-pago-comprobante")
+}
+Container(lambda, "Lambda guardar-log-dynamodb", "Node.js 20", "Guarda el evento en DynamoDB")
+ContainerDb(dynamo, "DynamoDB", "NoSQL", "Tabla LogsCompras")
+Container_Ext(github, "GitHub Actions", "CI/CD", "Despliegue por SSH")
+
+Rel(cLogs, kafka, "Consume", "Kafka")
+Rel(cPago, kafka, "Consume", "Kafka")
+Rel(cBoleta, kafka, "Consume", "Kafka")
+Rel(cLogs, lambda, "Invoca con el JSON", "AWS SDK")
+Rel(lambda, dynamo, "PutItem", "AWS SDK")
+Rel(github, ec2, "Despliega los 3 consumers", "SSH")
+```
+
+Cómo leerlo:
+
+- **Apache Kafka** es el origen de los mensajes.
+- Los **3 consumers** corren dentro de la **EC2 Amazon Linux**, en un proceso de PM2 llamado `consumers`.
+- Solo el consumer de logs invoca la **Lambda**.
+- La **Lambda** escribe en **DynamoDB**.
+- **GitHub Actions** se conecta por SSH a la EC2 para actualizar el código.
+
+### 13.5. Cómo funciona `consumers/index.js`, paso a paso
+
+1. **Carga las variables de entorno**
+
+   ```js
+   require("dotenv").config();
+   ```
+
+   Esto lee `consumers/.env` y deja los valores disponibles en `process.env`.
+
+2. **Crea el cliente de Lambda**
+
+   ```js
+   const clienteLambda = new LambdaClient({
+     region: process.env.AWS_REGION || "us-east-1",
+   });
+   ```
+
+   El SDK busca las credenciales en `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` y `AWS_SESSION_TOKEN`. No están escritas en el código.
+
+3. **Crea un solo cliente de Kafka**
+
+   ```js
+   const kafka = new Kafka({
+     clientId: "consumidores-compras",
+     brokers: BROKERS,
+   });
+   ```
+
+   `BROKERS` se arma separando `KAFKA_BROKERS` por comas, por si hay más de un broker.
+
+4. **Define los tres consumers**
+
+   ```js
+   const definiciones = [
+     { nombre: "logs-dynamodb", groupId: "grupo-logs-dynamo", procesar: procesarLogDynamo },
+     { nombre: "validacion-pago", groupId: "grupo-pago-validacion", procesar: procesarValidacionPago },
+     { nombre: "comprobante-pago", groupId: "grupo-pago-comprobante", procesar: procesarComprobantePago },
+   ];
+   ```
+
+   Cada definición tiene su `groupId` y la función que procesa el mensaje.
+
+5. **El consumer de logs invoca la Lambda**
+
+   ```js
+   const respuesta = await clienteLambda.send(
+     new InvokeCommand({
+       FunctionName: LAMBDA_LOGS_NAME,
+       InvocationType: "RequestResponse",
+       Payload: JSON.stringify(evento),
+     })
+   );
+   ```
+
+   - `FunctionName` viene de `LAMBDA_LOGS_NAME`.
+   - `Payload` es el JSON del mensaje, convertido a texto.
+   - `RequestResponse` espera la respuesta de la Lambda (no es asíncrono).
+
+6. **El consumer de validación revisa el monto**
+
+   ```js
+   const monto = Number(evento.monto);
+
+   if (monto > 0) {
+     console.log("[VALIDACION PAGO] Pago aprobado");
+     console.log(`[VALIDACION PAGO] Monto validado: ${monto}`);
+   } else {
+     console.log("[VALIDACION PAGO] Pago rechazado");
+     console.log(`[VALIDACION PAGO] Monto inválido: ${evento.monto}`);
+   }
+   ```
+
+   Si `monto` no existe o no es un número, `Number(...)` devuelve `NaN`, y `NaN > 0` es falso, así que el pago se rechaza.
+
+7. **El consumer de comprobante genera un código**
+
+   ```js
+   const codigoBoleta = Math.random().toString(36).slice(2, 8).toUpperCase();
+   console.log("[COMPROBANTE PAGO] Boleta generada");
+   console.log(`[COMPROBANTE PAGO] Código de boleta: ${codigoBoleta}`);
+   ```
+
+   `Math.random()` genera un número, se pasa a base 36 y se toman 6 caracteres. Es simple y sirve para la actividad; en producción se usaría un UUID.
+
+8. **Convierte el mensaje de Kafka a JSON**
+
+   ```js
+   const texto = message.value.toString();
+
+   try {
+     return JSON.parse(texto);
+   } catch (error) {
+     console.error("[CONSUMER] Mensaje ignorado, no es JSON válido:", texto);
+     return null;
+   }
+   ```
+
+   Kafka entrega `message.value` como un `Buffer`, por eso primero se convierte a texto. Si el mensaje no es JSON válido, se ignora y se registra el error.
+
+9. **Conecta cada consumer y se suscribe al topic**
+
+   ```js
+   await consumer.connect();
+   await consumer.subscribe({ topic: TOPIC, fromBeginning: true });
+   await consumer.run({ eachMessage: async (...) => { ... } });
+   ```
+
+   `consumer.run()` deja al consumer escuchando. Por cada mensaje se ejecuta `eachMessage`.
+
+10. **Cierra ordenadamente con Ctrl+C**
+
+    ```js
+    process.on("SIGINT", cerrar);
+    process.on("SIGTERM", cerrar);
+    ```
+
+    Al recibir `Ctrl+C` o una señal de PM2, se desconectan los consumers antes de salir.
+
+> Nota: si `procesar` lanza un error, el `try/catch` de `eachMessage` lo registra y el consumer sigue vivo. En un sistema real habría que decidir si se relanza el error para que Kafka reintente o si se envía a una cola de mensajes fallidos (DLQ).
+
+### 13.6. Código completo y comentado de `consumers/index.js`
+
+```js
+// ============================================================
+// Consumers de Kafka - compras-topic
+// 3 grupos distintos; cada grupo recibe una copia de cada mensaje.
+// Runtime: Node.js 20 (CommonJS)
+// ============================================================
+
+require("dotenv").config();
+
+const { Kafka } = require("kafkajs");
+const { LambdaClient, InvokeCommand } = require("@aws-sdk/client-lambda");
+
+// ---------- Configuración ----------
+const BROKERS = (process.env.KAFKA_BROKERS || "localhost:9092")
+  .split(",")
+  .map((broker) => broker.trim());
+
+const TOPIC = process.env.KAFKA_TOPIC || "compras-topic";
+const LAMBDA_LOGS_NAME = process.env.LAMBDA_LOGS_NAME || "guardar-log-dynamodb";
+
+// El cliente de Lambda lee las credenciales desde las variables de entorno
+// AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY y AWS_SESSION_TOKEN.
+const clienteLambda = new LambdaClient({
+  region: process.env.AWS_REGION || "us-east-1",
+});
+
+// Un solo cliente de Kafka. A partir de él se crean los 3 consumers.
+const kafka = new Kafka({
+  clientId: "consumidores-compras",
+  brokers: BROKERS,
+});
+
+// Guardamos las instancias para poder desconectarlas con Ctrl+C.
+const consumidores = [];
+let cerrando = false;
+
+// ---------- Lógica de cada consumer ----------
+async function procesarLogDynamo(evento) {
+  const respuesta = await clienteLambda.send(
+    new InvokeCommand({
+      FunctionName: LAMBDA_LOGS_NAME,
+      InvocationType: "RequestResponse",
+      Payload: JSON.stringify(evento),
+    })
+  );
+
+  const textoRespuesta = respuesta.Payload
+    ? Buffer.from(respuesta.Payload).toString()
+    : "(sin respuesta)";
+
+  console.log(`[LOGS DYNAMO] Lambda invocada (status ${respuesta.StatusCode})`);
+  console.log(`[LOGS DYNAMO] Respuesta: ${textoRespuesta}`);
+
+  if (respuesta.FunctionError) {
+    console.error(`[LOGS DYNAMO] La Lambda falló: ${respuesta.FunctionError}`);
+  }
+}
+
+async function procesarValidacionPago(evento) {
+  const monto = Number(evento.monto);
+
+  if (monto > 0) {
+    console.log("[VALIDACION PAGO] Pago aprobado");
+    console.log(`[VALIDACION PAGO] Monto validado: ${monto}`);
+  } else {
+    console.log("[VALIDACION PAGO] Pago rechazado");
+    console.log(`[VALIDACION PAGO] Monto inválido: ${evento.monto}`);
+  }
+}
+
+async function procesarComprobantePago(evento) {
+  // Código simple de 6 caracteres para la actividad.
+  const codigoBoleta = Math.random().toString(36).slice(2, 8).toUpperCase();
+
+  console.log("[COMPROBANTE PAGO] Boleta generada");
+  console.log(`[COMPROBANTE PAGO] Código de boleta: ${codigoBoleta}`);
+}
+
+// Los tres consumers leen el mismo topic, pero cada uno tiene su groupId.
+const definiciones = [
+  {
+    nombre: "logs-dynamodb",
+    groupId: "grupo-logs-dynamo",
+    procesar: procesarLogDynamo,
+  },
+  {
+    nombre: "validacion-pago",
+    groupId: "grupo-pago-validacion",
+    procesar: procesarValidacionPago,
+  },
+  {
+    nombre: "comprobante-pago",
+    groupId: "grupo-pago-comprobante",
+    procesar: procesarComprobantePago,
+  },
+];
+
+// ---------- Utilidades ----------
+function leerMensaje(message) {
+  if (!message.value) {
+    return null;
+  }
+
+  const texto = message.value.toString();
+
+  try {
+    return JSON.parse(texto);
+  } catch (error) {
+    console.error("[CONSUMER] Mensaje ignorado, no es JSON válido:", texto);
+    return null;
+  }
+}
+
+// ---------- Inicio y cierre de los consumers ----------
+async function iniciarConsumer(definicion) {
+  const consumer = kafka.consumer({ groupId: definicion.groupId });
+  consumidores.push(consumer);
+
+  await consumer.connect();
+  await consumer.subscribe({ topic: TOPIC, fromBeginning: true });
+
+  console.log(`[${definicion.nombre}] Conectado. groupId=${definicion.groupId}`);
+
+  await consumer.run({
+    eachMessage: async ({ topic, partition, message }) => {
+      const evento = leerMensaje(message);
+
+      if (evento === null) {
+        return;
+      }
+
+      console.log(
+        `[${definicion.nombre}] Mensaje recibido en ${topic} (partition=${partition}, offset=${message.offset})`
+      );
+
+      try {
+        await definicion.procesar(evento);
+      } catch (error) {
+        console.error(`[${definicion.nombre}] Error al procesar el mensaje:`, error.message);
+      }
+    },
+  });
+}
+
+async function cerrar() {
+  if (cerrando) {
+    return;
+  }
+
+  cerrando = true;
+  console.log("Cerrando consumers...");
+
+  await Promise.all(consumidores.map((consumer) => consumer.disconnect()));
+  process.exit(0);
+}
+
+process.on("SIGINT", cerrar);
+process.on("SIGTERM", cerrar);
+
+async function main() {
+  console.log(`Conectando a Kafka: ${BROKERS.join(", ")}`);
+  console.log(`Topic: ${TOPIC}`);
+  console.log(`Lambda: ${LAMBDA_LOGS_NAME}`);
+
+  await Promise.all(definiciones.map((definicion) => iniciarConsumer(definicion)));
+}
+
+main().catch((error) => {
+  console.error("Error fatal al iniciar los consumers:", error);
+  process.exit(1);
+});
+```
+
+El archivo real está en `consumers/index.js`.
+
+### 13.7. `package.json` y `.env.example`
+
+**`consumers/package.json`:**
+
+```json
+{
+  "name": "consumers",
+  "version": "1.0.0",
+  "description": "Tres consumers de Kafka para el topic compras-topic",
+  "main": "index.js",
+  "type": "commonjs",
+  "private": true,
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@aws-sdk/client-lambda": "^3.700.0",
+    "dotenv": "^16.4.7",
+    "kafkajs": "^2.2.4"
+  }
+}
+```
+
+- `kafkajs`: cliente de Kafka para Node.js.
+- `@aws-sdk/client-lambda`: permite invocar la Lambda.
+- `dotenv`: carga el archivo `.env`.
+
+**`consumers/.env.example`:**
+
+```dotenv
+# Dirección(es) del broker de Kafka. Si hay varios, sepáralos con coma.
+KAFKA_BROKERS=localhost:9092
+
+# Topic que consumen los tres grupos.
+KAFKA_TOPIC=compras-topic
+
+# Nombre exacto de la Lambda que guarda los logs.
+LAMBDA_LOGS_NAME=guardar-log-dynamodb
+
+# Región de AWS donde está la Lambda.
+AWS_REGION=us-east-1
+
+# Credenciales de AWS.
+# En AWS Academy también se usa AWS_SESSION_TOKEN.
+# Si la EC2 usa un rol de instancia, puedes borrar estas tres líneas.
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+AWS_SESSION_TOKEN=
+```
+
+Para probar localmente:
+
+```bash
+cd consumers
+npm install
+cp .env.example .env
+# editar .env con los valores reales
+npm start
+```
+
+### 13.8. Cómo funciona `deploy-consumers.yml`
+
+Archivo: `.github/workflows/deploy-consumers.yml`
+
+```yaml
+name: Deploy consumers Kafka
+
+# Solo se ejecuta si cambia algo dentro de consumers/ en la rama main.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "consumers/**"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Desplegar en la EC2 por SSH
+        uses: appleboy/ssh-action@v1.2.5
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true
+          script: |
+            cd /home/ec2-user/kafka-consumers-node/consumers
+            git pull origin main
+            npm install
+            pm2 restart consumers || pm2 start index.js --name consumers
+```
+
+Paso a paso:
+
+1. **`on.push.paths`**: este workflow solo corre si el push a `main` incluye cambios dentro de `consumers/`. Si cambias solo la Lambda, este workflow no se ejecuta.
+   > Ojo: el workflow de la Lambda (`deploy-lambda.yml`) no tiene filtro de rutas y corre en cada push a `main`, así que también se ejecutará cuando cambies `consumers/**`. No se modificó porque la consigna indica no tocar el CI/CD existente.
+2. **`appleboy/ssh-action`**: abre una conexión SSH a la EC2 usando la IP/DNS y la clave privada guardadas en los secrets.
+3. **`git pull origin main`**: actualiza el código en la EC2. Por eso la EC2 debe tener el repositorio clonado y acceso de lectura al repositorio.
+4. **`npm install`**: instala o actualiza las dependencias de `consumers/package.json` en la EC2.
+5. **`pm2 restart consumers || pm2 start index.js --name consumers`**: si el proceso `consumers` ya existe, lo reinicia; si no existe, lo crea. El `||` permite usar el mismo comando para el primer despliegue y para los siguientes.
+6. **`script_stop: true`**: si un comando falla, el workflow se detiene y no sigue con los demás.
+
+> No se hace `actions/checkout` porque el código no se copia desde GitHub a la EC2: la EC2 lo descarga directamente con `git pull`. Tampoco se copia el `.env`: ese archivo debe existir en la EC2 y no se versiona.
+
+### 13.9. Preparación de la EC2, IAM y secrets (antes del primer push)
+
+#### A. Preparar la EC2 Amazon Linux
+
+La EC2 debe tener Node.js, Git y PM2. Una secuencia posible en Amazon Linux 2023 es:
+
+```bash
+sudo dnf install -y git
+curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo bash -
+sudo dnf install -y nodejs
+sudo npm install -g pm2
+node --version
+pm2 --version
+```
+
+Clonar el repositorio y preparar la carpeta:
+
+```bash
+cd /home/ec2-user
+git clone https://github.com/TU_USUARIO/kafka-consumers-node.git
+cd kafka-consumers-node/consumers
+npm install
+cp .env.example .env
+nano .env
+chmod 600 .env
+```
+
+En `.env` debes poner:
+
+- La IP o DNS real del broker en `KAFKA_BROKERS`.
+- Las credenciales de AWS.
+- `AWS_SESSION_TOKEN` si usas AWS Academy.
+
+Probar una primera ejecución manual:
+
+```bash
+node index.js
+```
+
+Si los tres consumers se conectan, detén con `Ctrl+C` y arráncalos con PM2:
+
+```bash
+pm2 start index.js --name consumers
+pm2 save
+pm2 status
+```
+
+Opcional: configurar PM2 para que se reinicie al reiniciar la EC2:
+
+```bash
+pm2 startup
+# PM2 muestra un comando con sudo; cópialo y ejecútalo
+pm2 save
+```
+
+#### B. Crear la clave SSH y los secrets de la EC2
+
+1. En EC2, crea o usa un **key pair** de Amazon Linux. Descarga el archivo `.pem`.
+2. En tu computador, protege el archivo:
+
+   ```bash
+   chmod 400 kafka-consumers.pem
+   ```
+
+3. Prueba la conexión:
+
+   ```bash
+   ssh -i kafka-consumers.pem ec2-user@IP_O_DNS_DE_LA_EC2
+   ```
+
+4. En GitHub, ve a **Settings** → **Secrets and variables** → **Actions** y crea:
+
+| Secret | Valor |
+|---|---|
+| `EC2_HOST` | IP pública o DNS de la EC2 |
+| `EC2_USER` | `ec2-user` |
+| `EC2_SSH_KEY` | Contenido completo del archivo `.pem`, incluyendo `-----BEGIN...` y `-----END...` |
+
+> `EC2_SSH_KEY` es la **clave privada**, no el nombre del key pair. Nunca la subas al repositorio.
+
+5. El security group de la EC2 debe permitir SSH (puerto 22). Los runners de GitHub Actions usan IPs dinámicas, así que para la actividad normalmente se abre a `0.0.0.0/0`; en producción conviene restringirlo.
+
+#### C. Permisos para invocar la Lambda
+
+Las credenciales que están en el `.env` de la EC2 necesitan permiso para invocar la Lambda. Si usas un usuario o rol propio, agrégale una política como esta (reemplaza la cuenta y la región):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": "arn:aws:lambda:us-east-1:123456789012:function:guardar-log-dynamodb"
+    }
+  ]
+}
+```
+
+- Si usas **AWS Academy**, las credenciales del Learner Lab normalmente ya tienen permisos amplios; si no, revisa el rol del laboratorio.
+- Si la EC2 usa un **rol de instancia**, adjunta la política al rol y puedes borrar las tres variables `AWS_*` del `.env`.
+- Recuerda que el **rol de ejecución de la Lambda** (no el de la EC2) es el que necesita `dynamodb:PutItem`, como se explicó en la sección 6.2.
+
+#### D. Kafka debe ser accesible
+
+- Si Kafka está en la misma EC2, usa `KAFKA_BROKERS=localhost:9092`.
+- Si Kafka está en otra máquina, usa su IP o DNS y abre el puerto `9092` en el security group.
+- El broker debe anunciar una dirección que la EC2 pueda alcanzar (`advertised.listeners`). Si el broker anuncia `localhost`, la EC2 no podrá conectarse.
+- El topic debe existir. Puedes crearlo con:
+
+  ```bash
+  kafka-topics.sh --bootstrap-server IP_DEL_BROKER:9092 \
+    --create --topic compras-topic --partitions 1 --replication-factor 1
+  ```
+
+> El código usa Kafka sin autenticación (PLAINTEXT). Si usas Confluent Cloud u otro Kafka con SASL/SSL, hay que agregar `sasl` y `ssl` a la configuración del cliente.
+
+### 13.10. Cómo probar los 3 consumers
+
+1. Asegúrate de que los consumers estén corriendo:
+
+   ```bash
+   pm2 status
+   pm2 logs consumers
+   ```
+
+2. Abre una consola y escribe un mensaje en el topic con el productor de Kafka:
+
+   ```bash
+   kafka-console-producer.sh --bootstrap-server IP_DEL_BROKER:9092 \
+     --topic compras-topic
+   ```
+
+3. Pega este JSON y presiona Enter:
+
+   ```json
+   {"tipo":"compra","compraId":"C-1001","monto":25000,"cliente":"cristopher"}
+   ```
+
+4. En los logs de PM2 deberías ver mensajes de los tres grupos, por ejemplo:
+
+   ```text
+   [logs-dynamodb] Mensaje recibido en compras-topic (partition=0, offset=0)
+   [LOGS DYNAMO] Lambda invocada (status 200)
+   [LOGS DYNAMO] Respuesta: {"statusCode":200,"body":"Log guardado"}
+   [validacion-pago] Mensaje recibido en compras-topic (partition=0, offset=0)
+   [VALIDACION PAGO] Pago aprobado
+   [VALIDACION PAGO] Monto validado: 25000
+   [comprobante-pago] Mensaje recibido en compras-topic (partition=0, offset=0)
+   [COMPROBANTE PAGO] Boleta generada
+   [COMPROBANTE PAGO] Código de boleta: A1B2C3
+   ```
+
+   El orden exacto puede variar porque los tres consumers trabajan en paralelo.
+
+5. Verifica en **DynamoDB** → `LogsCompras` que apareció el registro con `id`, `fecha` y `evento`.
+
+6. Prueba un pago inválido:
+
+   ```json
+   {"tipo":"compra","compraId":"C-1002","monto":0}
+   ```
+
+   Deberías ver:
+
+   ```text
+   [VALIDACION PAGO] Pago rechazado
+   [VALIDACION PAGO] Monto inválido: 0
+   ```
+
+7. Para detener los consumers:
+
+   ```bash
+   pm2 stop consumers
+   ```
+
+> Si acabas de crear los grupos y el topic ya tenía mensajes, `fromBeginning: true` hará que los lean todos. Si no quieres reprocesar, cambia a `fromBeginning: false` y reinicia.
+
+### 13.11. Errores comunes de los consumers
+
+| Error | Causa probable | Solución |
+|---|---|---|
+| `KafkaJSConnectionError` / `ECONNREFUSED` | El broker no es accesible | Revisar IP, puerto 9092, security group y `advertised.listeners` |
+| `KafkaJSNumberOfRetriesExceeded` | Kafka no responde | Verificar que Kafka esté encendido y que `KAFKA_BROKERS` sea correcto |
+| `Topic not found` | El topic no existe | Crear `compras-topic` |
+| `CredentialsProviderError` | Faltan credenciales de AWS | Completar `AWS_ACCESS_KEY_ID` y `AWS_SECRET_ACCESS_KEY` en `.env` |
+| `ExpiredToken` | Las credenciales de AWS Academy caducaron | Copiar credenciales nuevas al `.env` y reiniciar PM2 |
+| `AccessDeniedException` al invocar la Lambda | Las credenciales no tienen `lambda:InvokeFunction` | Agregar la política de la sección 13.9 C |
+| `ResourceNotFoundException` al invocar | Nombre o región de la Lambda incorrectos | Revisar `LAMBDA_LOGS_NAME` y `AWS_REGION` |
+| `Cannot find module 'kafkajs'` | No se ejecutó `npm install` | Entrar a `consumers` y ejecutar `npm install` |
+| `pm2: command not found` | PM2 no está instalado o no está en el PATH | `sudo npm install -g pm2` y verificar el PATH |
+| `git pull` falla por autenticación | La EC2 no tiene acceso al repositorio | Configurar una deploy key o un token de solo lectura |
+| `Permission denied (publickey)` | La clave SSH no coincide | Revisar `EC2_SSH_KEY` y el key pair de la EC2 |
+| Se procesan mensajes antiguos | `fromBeginning: true` en un grupo nuevo | Es esperado; usar `false` si no se quieren reprocesar |
+
+### 13.12. Puntos clave para la defensa oral (Parte II)
+
+1. **Tres consumers, tres grupos**: cada `groupId` recibe una copia de todos los mensajes. Si compartieran grupo, Kafka repartiría los mensajes y no todos harían su tarea.
+2. **Un solo proceso**: los tres consumers viven en `consumers/index.js` y PM2 mantiene el proceso con el nombre `consumers`.
+3. **Consumer de logs**: usa `LambdaClient` y `InvokeCommand` para invocar `guardar-log-dynamodb` con `InvocationType: "RequestResponse"` y el JSON del mensaje.
+4. **Consumer de validación**: convierte `monto` con `Number()` y aprueba solo si es mayor que 0.
+5. **Consumer de comprobante**: genera un código aleatorio con `Math.random()` y lo imprime.
+6. **`fromBeginning: true`**: permite leer los mensajes existentes la primera vez que se crea cada grupo; en producción se usaría `false`.
+7. **Manejo de errores**: cada mensaje tiene su `try/catch`; si falla uno, el consumer sigue funcionando. En producción se podría relanzar el error o usar una DLQ.
+8. **Variables de entorno**: `dotenv` carga `.env`; las credenciales nunca están en el código ni en GitHub.
+9. **CI/CD con filtro de rutas**: `deploy-consumers.yml` solo se ejecuta si cambia `consumers/**`, y despliega por SSH en la EC2.
+10. **PM2**: `pm2 restart consumers || pm2 start index.js --name consumers` reinicia el proceso si existe o lo crea la primera vez.
+11. **Separación de permisos**: la EC2 necesita `lambda:InvokeFunction`; la Lambda necesita `dynamodb:PutItem`. Son dos roles/credenciales distintos.
+12. **Mejoras para producción**: usar `fromBeginning: false`, autenticación SASL/SSL si el broker la exige, UUID para la boleta, reintentos/DLQ y OIDC en lugar de claves de larga duración.

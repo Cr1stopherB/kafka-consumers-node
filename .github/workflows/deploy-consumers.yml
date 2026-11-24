@@ -1,0 +1,27 @@
+name: Deploy consumers Kafka
+
+# Solo se ejecuta si cambia algo dentro de consumers/ en la rama main.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "consumers/**"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Desplegar en la EC2 por SSH
+        uses: appleboy/ssh-action@v1.2.5
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true
+          script: |
+            cd /home/ec2-user/kafka-consumers-node/consumers
+            git pull origin main
+            npm install
+            pm2 restart consumers || pm2 start index.js --name consumers
