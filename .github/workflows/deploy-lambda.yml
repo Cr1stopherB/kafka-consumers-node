@@ -1,0 +1,36 @@
+name: Deploy Lambda guardar-log-dynamodb
+
+# Se ejecuta cada vez que se hace push a la rama main.
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    # Máquina virtual que GitHub presta para ejecutar el workflow.
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar el código del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales de AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          # Es opcional: si no usas AWS Academy puedes dejar el secret vacío.
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Empaquetar el código de la Lambda
+        run: |
+          cd guardar-log-dynamodb
+          zip -r ../function.zip .
+
+      - name: Actualizar el código en AWS Lambda
+        run: |
+          aws lambda update-function-code \
+            --function-name guardar-log-dynamodb \
+            --zip-file fileb://function.zip
